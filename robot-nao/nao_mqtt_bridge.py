@@ -6,16 +6,12 @@ import time
 import paho.mqtt.client as mqtt
 import qi
 from dotenv import load_dotenv
-import qi
-s = qi.Session()
-s.connect("tcp://127.0.0.1:PORT")
-print(s.services())
 
 load_dotenv()
 
-# Configuratie NAO
-NAO_IP = os.getenv("NAO_IP", "127.0.0.1")
-NAO_PORT = int(os.getenv("NAO_PORT", "9559"))
+# Configuratie NAO (NAO_PORT gol in .env: run.sh gaseste portul robotului virtual)
+NAO_IP = os.getenv("NAO_IP") or "127.0.0.1"
+NAO_PORT = int(os.getenv("NAO_PORT") or "9559")
 ROBOT_NAME = os.getenv("NAO_DEVICE_NAME", "nao_virtual")
 
 # Configuratie MQTT
