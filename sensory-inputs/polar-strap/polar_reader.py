@@ -34,7 +34,9 @@ DEVICE_ADDRESS = os.getenv("POLAR_DEVICE_ADDRESS", "").strip()
 
 CONTRACT_VERSION = 1
 PUBLISH_SECONDS = 1.0
-NO_DATA_SECONDS = 3.0          # no HR notification for this long -> "no_signal"
+NO_DATA_SECONDS = 12.0         # no HR notification for this long -> "no_signal"
+                               # (once PPI is requested the HR service updates only every ~5 s,
+                               # with occasional gaps of 7+ s; removal is caught sooner by PPI checks)
 RECONNECT_SECONDS = 5.0
 SCAN_SECONDS = 10.0
 RMSSD_WINDOW_SECONDS = 60      # beat intervals kept for RMSSD
@@ -42,14 +44,23 @@ PPI_TIMEOUT_SECONDS = 10.0     # PPI was streaming but stopped -> treat as not w
 
 # Artifact rejection for RMSSD
 MAX_PPI_ERROR_MS = 30          # sensor's own error estimate above this -> beat rejected
+                               # (measured median: 5-9 ms worn and still, 38-51 ms off the arm)
 MIN_RR_MS, MAX_RR_MS = 300, 2000   # 30-200 bpm
 MAX_SUCCESSIVE_CHANGE = 0.20   # interval jumping >20% vs the previous one -> artifact
+MAX_DEVIATION_FROM_MEDIAN = 0.35   # interval >35% away from the window median -> artifact
+                               # (catches runs of missed beats, which the jump rule lets through)
 MIN_RMSSD_DIFFS = 20           # fewer successive differences than this -> RMSSD is None
 
-# HR plausibility: the HR service keeps estimating (and drifts) while the armband is off
-# or just put back, so it must agree with the heart rate implied by recent PPI beats
-HR_CHECK_SECONDS = 10.0        # PPI beats used as reference (about two 5 s batches)
+# Heart rate: while PPI streams, HR comes from clean beats (the HR service is coarse in PPI mode
+# and drifts when the armband is off or just put back). If no beat of the last few seconds is
+# clean, the HR service is used only if it agrees with the clean beats of the whole window.
+HR_RECENT_SECONDS = 10.0       # beats used for the published HR (about two 5 s batches)
 MAX_HR_DISAGREEMENT_BPM = 15
+
+# Signal quality while PPI streams. Off the arm the sensor can keep producing plausible-looking
+# beats with contact=True (light/noise), so the two HR signals are cross-checked instead.
+MAX_PPI_VS_SENSOR_BPM = 20     # HR from beats vs the sensor's own HR (which is coarse in PPI mode)
+MIN_RECENT_CLEAN_FRACTION = 0.5    # fewer clean beats than this in the last HR_RECENT_SECONDS -> poor signal
 
 # BLE address: a MAC on Windows/Linux (A0:9E:1A:A6:FC:0B), a UUID on macOS
 ADDRESS_PATTERN = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$|^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$")
@@ -63,6 +74,7 @@ PMD_CONTROL_UUID = "fb005c81-02e7-f387-1cad-8acd2d8df0c8"
 PMD_DATA_UUID = "fb005c82-02e7-f387-1cad-8acd2d8df0c8"
 PMD_TYPE_PPI = 0x03
 PMD_OP_START = 0x02
+PMD_OP_STOP = 0x03
 PMD_RESPONSE_CODE = 0xF0
 PPI_SAMPLE_BYTES = 6
 
@@ -129,12 +141,13 @@ def is_reliable(beat):
     """Checks that need only the beat itself: sensor flags and physiological range."""
     error = beat["error_ms"]
     return (not beat["blocker"]
+            and beat.get("contact") is not False
             and (error is None or error <= MAX_PPI_ERROR_MS)
             and MIN_RR_MS <= beat["ppi_ms"] <= MAX_RR_MS)
 
 
-def clean_successive_diffs(beats):
-    """Artifact rejection; returns (kept beat count, successive differences in ms).
+def clean_beats(beats):
+    """Artifact rejection; returns (indices of kept beats, successive differences in ms).
 
     beats: oldest first, each {"ppi_ms": int, "error_ms": int | None, "blocker": bool}
     (error_ms is None and blocker False for RR intervals from the standard HR service).
@@ -142,25 +155,30 @@ def clean_successive_diffs(beats):
     A difference is only taken between two beats that were next to each other and both
     kept. Bridging a rejected beat would compare non-adjacent intervals and inflate RMSSD.
     """
-    kept = 0
+    reliable = [beat["ppi_ms"] for beat in beats if is_reliable(beat)]
+    if not reliable:
+        return [], []
+    median = statistics.median(reliable)
+    kept = []
     diffs = []
     previous = None  # last kept interval, reset to None by every rejected beat
-    for beat in beats:
+    for i, beat in enumerate(beats):
         rr = beat["ppi_ms"]
+        outlier = abs(rr - median) > MAX_DEVIATION_FROM_MEDIAN * median
         jump = previous is not None and abs(rr - previous) > MAX_SUCCESSIVE_CHANGE * previous
-        if not is_reliable(beat) or jump:
+        if not is_reliable(beat) or outlier or jump:
             previous = None
             continue
         if previous is not None:
             diffs.append(rr - previous)
         previous = rr
-        kept += 1
+        kept.append(i)
     return kept, diffs
 
 
 def compute_rmssd(beats):
     """RMSSD in ms (root mean square of successive differences), or None without enough clean data."""
-    _, diffs = clean_successive_diffs(beats)
+    _, diffs = clean_beats(beats)
     if len(diffs) < MIN_RMSSD_DIFFS:
         return None
     return round(math.sqrt(sum(d * d for d in diffs) / len(diffs)), 1)
@@ -174,6 +192,7 @@ class PolarState:
         self.device_name = None
         self.hr = None
         self.hr_contact = None
+        self.hr_source = None       # "ppi" or "sensor": where the last published HR came from
         self.last_notification = 0.0
         self.pending_rr = []        # intervals since the last publish
         self.beats = deque()        # (arrival time, beat dict) for RMSSD
@@ -185,9 +204,13 @@ class PolarState:
         self.ppi_active = False     # True once the first PPI sample arrives
         self.ppi_contact = None
         self.last_ppi = 0.0
+        self.beats.clear()          # beats from before a reconnect are not adjacent to new ones
 
     def add_beats(self, beats, now):
         self.rr_supported = True
+        if self.beats and now - self.beats[-1][0] > PPI_TIMEOUT_SECONDS:
+            self.beats.clear()      # gap (armband off): don't diff across it
+
         for beat in beats:
             if not beat["blocker"]:
                 self.pending_rr.append(beat["ppi_ms"])
@@ -232,20 +255,65 @@ class PolarState:
     def contact(self):
         return self.ppi_contact if self.ppi_active else self.hr_contact
 
+    def recent_beats(self, now, seconds):
+        """(number of PPI beats from the last `seconds`, intervals among them that survived cleaning).
+
+        Cleaning runs over the whole window, so the median and jump rules have context
+        even for the newest beats.
+        """
+        entries = list(self.beats)
+        kept = set(clean_beats([beat for _, beat in entries])[0])
+        recent = [i for i, (t, beat) in enumerate(entries)
+                  if now - t <= seconds and beat["error_ms"] is not None]
+        return len(recent), [entries[i][1]["ppi_ms"] for i in recent if i in kept]
+
+    def clean_ppi_hr(self, now, seconds):
+        """Heart rate (bpm) from the median clean PPI interval of the last `seconds`, or None."""
+        _, intervals = self.recent_beats(now, seconds)
+        return 60000 / statistics.median(intervals) if intervals else None
+
+    def heart_rate(self, now):
+        """Return (hr_bpm, source, None) for the value to publish, or (None, None, reason)."""
+        if not self.connected:
+            return None, None, "not connected"
+        if self.contact is False:
+            return None, None, "no skin contact"
+        if self.ppi_active:
+            # Off the skin the armband keeps sending HR; PPI is what stops or flags no contact
+            if now - self.last_ppi > PPI_TIMEOUT_SECONDS:
+                return None, None, "PPI stopped (armband off?)"
+            # Taken off the arm, the sensor's own HR stopped while PPI kept sending fake beats
+            if now - self.last_notification > NO_DATA_SECONDS or not self.hr:
+                return None, None, "no heart rate data from the sensor"
+            total, intervals = self.recent_beats(now, HR_RECENT_SECONDS)
+            if total and len(intervals) / total < MIN_RECENT_CLEAN_FRACTION:
+                return None, None, f"poor signal ({len(intervals)}/{total} recent beats clean)"
+            if intervals:
+                hr = 60000 / statistics.median(intervals)
+                if abs(hr - self.hr) > MAX_PPI_VS_SENSOR_BPM:
+                    return None, None, f"PPI HR {hr:.0f} disagrees with sensor HR {self.hr}"
+                return hr, "ppi", None
+        # Fallback: the HR service (before PPI starts, or when no recent beat was clean)
+        if now - self.last_notification > NO_DATA_SECONDS or not self.hr:
+            return None, None, "no heart rate data"
+        if self.ppi_active:
+            reference = self.clean_ppi_hr(now, RMSSD_WINDOW_SECONDS)
+            if reference is not None and abs(self.hr - reference) > MAX_HR_DISAGREEMENT_BPM:
+                return None, None, f"HR {self.hr} disagrees with clean PPI beats ({reference:.0f} bpm)"
+        return float(self.hr), "sensor", None
+
     def take_packet(self, now):
-        """Return (status, data) for the next message and reset the per-message RR buffer."""
+        """Return (status, data, reason) for the next message and reset the per-message RR buffer."""
         rr, self.pending_rr = self.pending_rr, []
-        # Off the skin the armband keeps sending HR; PPI is what stops or flags no contact
-        ppi_stalled = self.ppi_active and now - self.last_ppi > PPI_TIMEOUT_SECONDS
-        if (not self.connected or now - self.last_notification > NO_DATA_SECONDS
-                or not self.hr or self.contact is False or ppi_stalled):
-            return "no_signal", None
+        hr, self.hr_source, reason = self.heart_rate(now)
+        if reason:
+            return "no_signal", None, reason
         return "ok", {
-            "hr_bpm": float(self.hr),
+            "hr_bpm": round(hr, 1),
             "rr_ms": rr if self.rr_supported else None,
             "rmssd_ms": compute_rmssd([beat for _, beat in self.beats]),
             "contact": self.contact,
-        }
+        }, None
 
 
 def envelope(status, data):
@@ -265,12 +333,20 @@ def is_polar(device, adv=None):
     return name.startswith("Polar")
 
 
+STUCK_BLUETOOTH_HINT = ("[POLAR] No Bluetooth devices seen at all: the laptop's Bluetooth looks stuck.\n"
+                        "        Turn Bluetooth off and on (Win+A), or restart the laptop if that doesn't help.")
+
+
 async def scan():
     print(f"[POLAR] Scanning for {SCAN_SECONDS:.0f} s...")
     found = await BleakScanner.discover(timeout=SCAN_SECONDS, return_adv=True)
     polar = sorted(((d, adv) for d, adv in found.values() if is_polar(d, adv)), key=lambda x: -x[1].rssi)
+    if not found:
+        print(STUCK_BLUETOOTH_HINT)
+        return
     if not polar:
-        print("[POLAR] No Polar device found. Is it switched on, worn, and disconnected from the phone app?")
+        print(f"[POLAR] No Polar device among {len(found)} nearby devices. Is it switched on, worn,"
+              " and not connected to a phone or another program?")
         return
     for device, adv in polar:
         print(f"  {device.address}  {device.name or adv.local_name}  RSSI {adv.rssi} dBm")
@@ -279,9 +355,28 @@ async def scan():
 
 
 async def find_polar():
-    if DEVICE_ADDRESS:
-        return await BleakScanner.find_device_by_address(DEVICE_ADDRESS, timeout=SCAN_SECONDS)
-    return await BleakScanner.find_device_by_filter(is_polar, timeout=SCAN_SECONDS)
+    """Scan until the sensor shows up; returns (device or None, number of BLE devices seen in total).
+
+    The total tells a stuck laptop Bluetooth (sees nothing at all) apart from a sensor
+    that is off or busy (other devices are seen).
+    """
+    seen = set()
+    match = {}
+    found = asyncio.Event()
+
+    def on_detect(device, adv):
+        seen.add(device.address)
+        wanted = (device.address.upper() == DEVICE_ADDRESS.upper()) if DEVICE_ADDRESS else is_polar(device, adv)
+        if wanted and not found.is_set():
+            match["device"] = device
+            found.set()
+
+    async with BleakScanner(detection_callback=on_detect):
+        try:
+            await asyncio.wait_for(found.wait(), SCAN_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+    return match.get("device"), len(seen)
 
 
 async def start_ppi(client, state):
@@ -298,15 +393,29 @@ async def start_ppi(client, state):
         print(f"[POLAR] Could not start PPI ({e}); continuing with heart rate only.")
 
 
+async def stop_ppi(client):
+    """Ask the sensor to stop PPI before disconnecting, so it is idle for the next connection."""
+    try:
+        await asyncio.wait_for(
+            client.write_gatt_char(PMD_CONTROL_UUID, bytes([PMD_OP_STOP, PMD_TYPE_PPI]), response=True), 2.0)
+    except Exception:
+        pass  # best effort: the link may already be gone
+
+
 async def sensor_loop(state):
     """Connect, subscribe to heart rate notifications and reconnect whenever the link drops."""
     loop = asyncio.get_running_loop()
     while True:
         target = DEVICE_ADDRESS or "any Polar device"
         print(f"[POLAR] Looking for {target}...")
-        device = await find_polar()
+        device, seen = await find_polar()
         if device is None:
-            print(f"[POLAR] Not found. Retrying in {RECONNECT_SECONDS:.0f} s...")
+            if seen == 0:
+                print(STUCK_BLUETOOTH_HINT)
+            else:
+                print(f"[POLAR] Not found among {seen} nearby devices. Is it on, and not connected"
+                      " to a phone or another program?")
+            print(f"[POLAR] Retrying in {RECONNECT_SECONDS:.0f} s...")
             await asyncio.sleep(RECONNECT_SECONDS)
             continue
 
@@ -333,7 +442,13 @@ async def sensor_loop(state):
                 state.reset_ppi()
                 await start_ppi(client, state)
                 state.connected = True
-                await disconnected.wait()
+                try:
+                    await disconnected.wait()
+                finally:
+                    # Also runs on Ctrl+C: leave the sensor idle before the link is closed
+                    if client.is_connected:
+                        print("[POLAR] Stopping PPI and disconnecting...")
+                        await stop_ppi(client)
         except Exception as e:
             print(f"[POLAR] Connection error: {e}")
         finally:
@@ -343,18 +458,27 @@ async def sensor_loop(state):
 
 
 async def publish_loop(state, mqtt_client):
-    previous_status = None
+    previous_reason = None
     while True:
-        status, data = state.take_packet(time.time())
+        now = time.time()
+        status, data, reason = state.take_packet(now)
         if mqtt_client:
             mqtt_client.publish(MQTT_TOPIC, json.dumps(envelope(status, data)))
+        # Median error estimate of recent PPI beats, to tune MAX_PPI_ERROR_MS from real data
+        errors = [beat["error_ms"] for t, beat in state.beats
+                  if now - t <= HR_RECENT_SECONDS and beat["error_ms"] is not None]
+        error = f"{statistics.median(errors):.0f} ms" if errors else "n/a"
         if data:
             rr = "n/a" if data["rr_ms"] is None else len(data["rr_ms"])
-            print(f"[POLAR] HR {data['hr_bpm']:.0f} bpm | RR intervals {rr} | RMSSD {data['rmssd_ms']} | contact {data['contact']}")
-        elif status != previous_status:
-            # Still published every second, only printed when it starts
-            print(f"[POLAR] {status} (connected={state.connected})")
-        previous_status = status
+            # Share of beats in the RMSSD window that survived artifact rejection
+            window = [beat for _, beat in state.beats]
+            clean = f"{len(clean_beats(window)[0])}/{len(window)}" if window else "n/a"
+            print(f"[POLAR] HR {data['hr_bpm']:.0f} bpm ({state.hr_source}) | RR intervals {rr} | clean beats {clean}"
+                  f" | beat error {error} | RMSSD {data['rmssd_ms']} | contact {data['contact']}")
+        elif reason != previous_reason:
+            # Still published every second, only printed when the reason changes
+            print(f"[POLAR] no_signal: {reason} | beat error {error}")
+        previous_reason = reason
         await asyncio.sleep(PUBLISH_SECONDS)
 
 
