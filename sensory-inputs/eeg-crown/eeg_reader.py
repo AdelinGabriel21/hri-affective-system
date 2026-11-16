@@ -16,6 +16,9 @@ MQTT_TOPIC = os.getenv("MQTT_TOPIC", "telemetry/eeg")
 USE_WSS = os.getenv("MQTT_USE_WSS", "true").lower() == "true"
 
 DEVICE_ID = os.getenv("NEUROSITY_DEVICE_ID", "").strip()
+# Numele publicat in campul "device" din mesaj. Nu publicam DEVICE_ID-ul real,
+# pentru ca ajunge pe broker si il vad toti subscriberii.
+DEVICE_NAME = "neurosity_crown"
 EMAIL = os.getenv("NEUROSITY_EMAIL", "").strip()
 PASSWORD = os.getenv("NEUROSITY_PASSWORD", "")
 
@@ -24,13 +27,12 @@ F6 = 5
 MAX_AGE_SECONDS = 3
 
 latest = {
-    "bands": None,
+    "bands": {},
     "bands_time": 0,
     "calm": None,
     "focus": None,
     "quality": None,
 }
-
 
 def on_bands(message):
     latest["bands"] = message["data"]
@@ -48,6 +50,10 @@ def on_focus(message):
 def on_quality(message):
     latest["quality"] = message
 
+    # Debug: afișăm primul mesaj primit de la signal_quality
+    if not latest.get("quality_debug_printed"):
+        print("[DEBUG] Signal quality payload:", repr(message)[:1000])
+        latest["quality_debug_printed"] = True
 
 def create_mqtt_client():
     if USE_WSS:
@@ -89,7 +95,7 @@ def build_message(status, data):
     return {
         "v": 1,
         "source": "eeg",
-        "device": DEVICE_ID or "crown-sim",
+        "device": DEVICE_NAME if DEVICE_ID else "crown-sim",
         "timestamp": time.time(),
         "status": status,
         "mock": not DEVICE_ID,
@@ -106,14 +112,36 @@ def get_real_data():
     bands = latest["bands"]
     quality = latest["quality"]
 
-    if bands is None or quality is None:
+    # Verificăm dacă am primit date
+    if not isinstance(bands, dict) or not bands:
         return "no_signal", None
 
     if time.time() - latest["bands_time"] > MAX_AGE_SECONDS:
         return "no_signal", None
 
-    if quality[F5]["status"] == "bad" or quality[F6]["status"] == "bad":
+    # Așteptăm să primim date valide de signal quality
+    if not isinstance(quality, (list, tuple)) or len(quality) <= max(F5, F6):
         return "no_signal", None
+
+    # Verificăm dacă avem informațiile pentru ambele canale
+    quality_f5 = quality[F5]
+    quality_f6 = quality[F6]
+
+    if not isinstance(quality_f5, dict) or not isinstance(quality_f6, dict):
+        return "no_signal", None
+
+    status_f5 = quality_f5["status"]
+    status_f6 = quality_f6["status"]
+
+    if status_f5 == "bad" or status_f6 == "bad":
+        sd_f5 = quality_f5["standardDeviation"]
+        sd_f6 = quality_f6["standardDeviation"]
+
+        print(f"[DEBUG] F5={sd_f5} ({status_f5}) | F6={sd_f6} ({status_f6})")
+        return "no_signal", None
+
+    # Restul funcției tale rămâne neschimbat:
+    # alpha_left, alpha_right, FAA, calm, focus etc.
 
     alpha_left = bands["alpha"][F5]
     alpha_right = bands["alpha"][F6]
