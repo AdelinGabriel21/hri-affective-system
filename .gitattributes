@@ -1,0 +1,4 @@
+# Shell scripts must keep LF line endings, or bash fails on Windows checkouts ("\r: command not found")
+*.sh text eol=lf
+# Batch files expect CRLF
+*.bat text eol=crlf

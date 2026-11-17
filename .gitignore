@@ -19,4 +19,4 @@ __pycache__/
 
 # OS specific
 Thumbs.db
-.DS_Store
+.DS_Storevenv-win/
