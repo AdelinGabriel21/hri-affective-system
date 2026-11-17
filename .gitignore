@@ -1,5 +1,6 @@
 # Virtual environments
 venv/
+venv-win/
 .venv/
 env/
 VirtualEnvName/
@@ -19,4 +20,4 @@ __pycache__/
 
 # OS specific
 Thumbs.db
-.DS_Storevenv-win/
+.DS_Store
