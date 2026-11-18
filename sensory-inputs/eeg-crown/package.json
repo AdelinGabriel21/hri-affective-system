@@ -1,0 +1,18 @@
+{
+  "name": "eeg-crown-signal-quality-test",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Test signal quality V1 vs V2 cu SDK-ul JavaScript Neurosity",
+  "main": "test_signal_quality.js",
+  "scripts": {
+    "test:quality": "node test_signal_quality.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@neurosity/sdk": "^7.5.1",
+    "dotenv": "^16.4.5"
+  }
+}
