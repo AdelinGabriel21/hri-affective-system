@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@neurosity/sdk": "^7.5.1",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "mqtt": "^5.16.1"
   }
 }
