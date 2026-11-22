@@ -8,7 +8,7 @@ from deepface import DeepFace
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv() #loads stuff
 
 MQTT_HOST = os.getenv("MQTT_HOST", "hri.thecraceatree.com")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 443))
